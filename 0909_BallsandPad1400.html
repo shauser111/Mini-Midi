@@ -1,0 +1,675 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Percentage Balls with Audio Visualizer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/webmidi@latest/dist/iife/webmidi.iife.js"></script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            touch-action: none;
+            overflow: hidden;
+        }
+        .ball-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 2;
+        }
+        #visualizer-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1; 
+        }
+        .ball {
+            position: absolute;
+            transform: translate(-50%, -50%);
+            cursor: grab;
+            user-select: none;
+            transition: width 0.05s linear, height 0.05s linear;
+            border-radius: 50%;
+        }
+        .ball:active {
+            cursor: grabbing;
+            z-index: 10;
+        }
+        #audio-controls {
+            position: fixed;
+            bottom: 15px;
+            left: 15px;
+            opacity: 0.4;
+            transition: opacity 0.3s ease-in-out;
+            z-index: 100;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        #audio-controls:hover {
+            opacity: 1;
+        }
+        #audio-player {
+           display: none;
+        }
+        #midi-status {
+            position: fixed;
+            top: 15px;
+            left: 50%;
+            transform: translateX(-50%);
+            background-color: rgba(30, 180, 100, 0.8);
+            color: white;
+            padding: 8px 16px;
+            border-radius: 8px;
+            z-index: 100;
+            font-size: 0.9em;
+            display: none;
+            opacity: 0;
+            transition: opacity 0.3s ease-in-out;
+        }
+    </style>
+</head>
+<body class="bg-gray-800 flex items-center justify-center min-h-screen">
+
+    <div id="midi-status">Awaiting MIDI...</div>
+
+    <div id="container" class="bg-gray-800 w-full max-w-4xl aspect-video mx-4 p-4 rounded-2xl text-center relative">
+        <canvas id="visualizer-canvas"></canvas>
+        <div id="ball-container" class="ball-container">
+            </div>
+    </div>
+
+    <div id="audio-controls">
+        <audio id="audio-player" src="https://shauser111.github.io/Music09042025/music/track1.mp3" crossOrigin="anonymous"></audio>
+    </div>
+
+<script>
+    const container = document.getElementById('container');
+    const ballContainer = document.getElementById('ball-container');
+    const canvas = document.getElementById('visualizer-canvas');
+    const ctx = canvas.getContext('2d');
+    const statusDiv = document.getElementById('midi-status');
+    
+    const BALL_COUNT = 7;
+    const EQ_SENSITIVITY = 1.0; 
+    const THROW_MULTIPLIER = 1.5;
+    const MAX_THROW_SPEED = 30;
+    const balls = [];
+    const eqBarHeights = [];
+    let activeBall = null;
+    let startX, startY;
+    let lastPlaybackRate = 1.0;
+    const particles = [];
+    let hasMusicStartedOnce = false;
+    
+    // --- NATIVE MIDI INTEGRATION START ---
+    let launchpadInput = null;
+    let launchpadOutput = null;
+
+    const launchpadPlayPauseButton = 19;
+    const launchpadClearButton = 29;
+    const launchpadResetSpeedButton = 58; // Note 58
+    const arrowUp = 91, arrowDown = 92, arrowLeft = 93, arrowRight = 94;
+    const launchpadColorMap = [46, 72, 92, 74, 50, 54, 21];
+    const launchpadColorGreen = 21;
+    const launchpadColorWhite = 3;
+    const launchpadDimWhite = 71;
+    const launchpadColorYellow = 13;
+    let lastLaunchpadState = new Map();
+    let statusTimeout;
+    const flashStates = {};
+    let hudActiveUntil = 0;
+
+    const launchpadGrid = Array(8).fill(null).map((_, r) =>
+        Array(8).fill(null).map((__, c) => (8 - r) * 10 + (c + 1))
+    );
+
+    if (navigator.requestMIDIAccess) {
+        navigator.requestMIDIAccess({ sysex: true })
+            .then(onMIDISuccess, onMIDIFailure);
+    } else {
+        statusDiv.textContent = "Web MIDI API not supported in this browser.";
+    }
+
+    function onMIDIFailure(msg) {
+        statusDiv.textContent = `Failed to get MIDI access - ${msg}`;
+    }
+
+    function onMIDISuccess(midiAccess) {
+        const inputDeviceName = "Launchpad Mini MK3 LPMiniMK3 MIDI Out";
+        const outputDeviceName = "Launchpad Mini MK3 LPMiniMK3 MIDI In";
+        
+        for (let input of midiAccess.inputs.values()) { if (input.name === inputDeviceName) { launchpadInput = input; break; } }
+        for (let output of midiAccess.outputs.values()) { if (output.name === outputDeviceName) { launchpadOutput = output; break; } }
+
+        if (launchpadInput && launchpadOutput) {
+            statusDiv.textContent = "✅ Launchpad Mini connected!";
+            launchpadOutput.send([240, 0, 32, 41, 2, 13, 14, 1, 247]);
+            clearLaunchpadScreen();
+            launchpadInput.onmidimessage = handleMIDIMessage;
+        } else {
+            statusDiv.textContent = "Launchpad Mini not found.";
+        }
+    }
+
+    function handleMIDIMessage(event) {
+        const [command, id, velocity] = event.data;
+        
+        clearTimeout(statusTimeout);
+        statusDiv.textContent = `Heard: Cmd ${command}, ID ${id}`;
+        statusDiv.style.display = 'block';
+        statusDiv.style.opacity = '1';
+        statusTimeout = setTimeout(() => {
+            statusDiv.style.opacity = '0';
+            setTimeout(() => { statusDiv.style.display = 'none'; }, 300);
+        }, 1000);
+
+        if (velocity > 0) {
+            if (command === 176) { // Control Change messages
+                if (id === launchpadPlayPauseButton) {
+                    if (audioPlayer.paused) {
+                        if (!hasMusicStartedOnce) { setupAudioContext(); hasMusicStartedOnce = true; }
+                        audioPlayer.play();
+                    } else {
+                        audioPlayer.pause();
+                    }
+                } else if (id === launchpadClearButton) {
+                    location.reload();
+                } else if ([arrowUp, arrowDown, arrowLeft, arrowRight].includes(id)) {
+                    flashStates[id] = Date.now() + 150;
+                    if (id === arrowUp) updateAudioParams({deltaVolume: 0.05});
+                    if (id === arrowDown) updateAudioParams({deltaVolume: -0.05});
+                    if (id === arrowRight) updateAudioParams({deltaSpeed: 0.02});
+                    if (id === arrowLeft) updateAudioParams({deltaSpeed: -0.02});
+                }
+            } else if (command === 144) { // Note On messages
+                 if (id === launchpadResetSpeedButton) {
+                    flashStates[id] = Date.now() + 150;
+                    updateAudioParams({absoluteSpeed: 1.0});
+                }
+            }
+        }
+    }
+    
+    function clearLaunchpadScreen() {
+        if (!launchpadOutput) return;
+        const sysExHeader = [240, 0, 32, 41, 2, 13, 3];
+        const sysExFooter = [247];
+        let colorSpecs = [];
+        for (let r = 0; r < 8; r++) { for (let c = 0; c < 8; c++) { colorSpecs.push(0, launchpadGrid[r][c], 0); } }
+        for (let i = 1; i < 9; i++) { colorSpecs.push(0, i * 10 + 9, 0); }
+        for (let i = 91; i < 99; i++) { colorSpecs.push(0, i, 0); }
+        launchpadOutput.send([...sysExHeader, ...colorSpecs, ...sysExFooter]);
+        lastLaunchpadState.clear();
+    }
+
+    function updateLaunchpadDisplay() {
+        if (!launchpadOutput || !analyser) return;
+
+        const padColors = new Map();
+        const eqColors = [49, 41, 33];
+        const eqMaxHeight = 3;
+        const eqPairs = 4;
+        const binSize = Math.floor((analyser.frequencyBinCount / 2) / eqPairs);
+
+        for (let i = 0; i < eqPairs; i++) {
+            let binTotal = 0;
+            for (let j = 0; j < binSize; j++) { binTotal += frequencyData[i * binSize + j]; }
+            const binAvg = binTotal / binSize;
+            const barHeight = Math.min(eqMaxHeight, Math.floor((binAvg / 255) * (eqMaxHeight + 1.5)));
+            const leftCol = 3 - i, rightCol = 4 + i;
+
+            for (let h = 0; h < barHeight; h++) {
+                const row = 7 - h, color = eqColors[h % eqColors.length];
+                const leftNote = launchpadGrid[row][leftCol], rightNote = launchpadGrid[row][rightCol];
+                if (!padColors.has(leftNote)) padColors.set(leftNote, []);
+                padColors.get(leftNote).push(color);
+                if (!padColors.has(rightNote)) padColors.set(rightNote, []);
+                padColors.get(rightNote).push(color);
+            }
+        }
+        
+        if (Date.now() < hudActiveUntil) {
+            const volHeight = Math.ceil(audioPlayer.volume * 8);
+            for (let h = 0; h < volHeight; h++) {
+                const row = 7 - h;
+                padColors.set(launchpadGrid[row][0], [launchpadColorWhite]);
+            }
+            const speedRatio = (audioPlayer.playbackRate - 0.5) / 0.75;
+            const speedRow = 7 - Math.round(speedRatio * 7); // Use full column
+            const speedNote = launchpadGrid[speedRow][7];
+             
+            if (audioPlayer.playbackRate >= 1.25) {
+                padColors.set(speedNote, [launchpadColorWhite, launchpadDimWhite]);
+            } else {
+                padColors.set(speedNote, [launchpadColorWhite]);
+            }
+        }
+
+        balls.forEach(ball => {
+            const padX = Math.max(0, Math.min(7, Math.floor((ball.x / ballContainer.clientWidth) * 8)));
+            const padY = Math.max(0, Math.min(7, Math.floor((ball.y / ballContainer.clientHeight) * 8)));
+            const note = launchpadGrid[padY][padX];
+            const color = launchpadColorMap[ball.id % launchpadColorMap.length];
+            if (!padColors.has(note)) padColors.set(note, []);
+            padColors.get(note).push(color);
+        });
+
+        const newLaunchpadState = new Map();
+        const sysExHeader = [240, 0, 32, 41, 2, 13, 3];
+        const sysExFooter = [247];
+        let colorSpecs = [];
+
+        const playPauseColor = audioPlayer.paused ? launchpadColorWhite : launchpadColorGreen;
+        newLaunchpadState.set(launchpadPlayPauseButton, { mode: 'static', colors: [playPauseColor] });
+        newLaunchpadState.set(launchpadClearButton, { mode: 'static', colors: [launchpadColorYellow] });
+        newLaunchpadState.set(launchpadResetSpeedButton, { mode: 'static', colors: [launchpadDimWhite] });
+        
+        const now = Date.now();
+        [arrowUp, arrowDown, arrowLeft, arrowRight].forEach(key => {
+            const color = (flashStates[key] && now < flashStates[key]) ? launchpadColorWhite : launchpadDimWhite;
+            newLaunchpadState.set(key, { mode: 'static', colors: [color] });
+        });
+        
+        padColors.forEach((colors, note) => {
+            const isMaxSpeedPulse = (note === launchpadGrid[0][7] && audioPlayer.playbackRate >= 1.25);
+            if (isMaxSpeedPulse) {
+                newLaunchpadState.set(note, { mode: 'pulsing', colors: [launchpadColorWhite]});
+            } else if (colors.length > 1) { 
+                newLaunchpadState.set(note, { mode: 'flashing', colors: [colors[0], colors[1]] }); 
+            } else if (colors.length === 1) { 
+                newLaunchpadState.set(note, { mode: 'static', colors: [colors[0]] }); 
+            }
+        });
+
+        const stateChanged = (note, newState) => {
+            const oldState = lastLaunchpadState.get(note);
+            if (!oldState || oldState.mode !== newState.mode || oldState.colors[0] !== newState.colors[0]) return true;
+            if (newState.mode === 'flashing' && oldState.colors[1] !== newState.colors[1]) return true;
+            return false;
+        };
+
+        lastLaunchpadState.forEach((oldState, note) => { if (!newLaunchpadState.has(note)) { colorSpecs.push(0, note, 0); }});
+        newLaunchpadState.forEach((newState, note) => {
+            if (stateChanged(note, newState)) {
+                if (newState.mode === 'static') { colorSpecs.push(0, note, newState.colors[0]); } 
+                else if (newState.mode === 'flashing') { colorSpecs.push(1, note, newState.colors[0], newState.colors[1]); }
+                else if (newState.mode === 'pulsing') { colorSpecs.push(2, note, newState.colors[0]); }
+            }
+        });
+
+        if (colorSpecs.length > 0) {
+            const message = [...sysExHeader, ...colorSpecs, ...sysExFooter];
+            if (message.length < 1024) { launchpadOutput.send(message); }
+        }
+
+        lastLaunchpadState = new Map(newLaunchpadState);
+    }
+
+    const colors = ['#3a09cc', '#F87171', '#60A5FA', '#FBBF24', '#A78BFA', '#F472B6', '#4ADE80'];
+    const audioPlayer = document.getElementById('audio-player');
+    let audioContext, analyser, sourceNode, frequencyData;
+
+    function setupAudioContext() {
+        if (audioContext) return;
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        sourceNode = audioContext.createMediaElementSource(audioPlayer);
+        analyser = audioContext.createAnalyser();
+        analyser.fftSize = 256;
+        analyser.smoothingTimeConstant = 0.7;
+        const bufferLength = analyser.frequencyBinCount;
+        frequencyData = new Uint8Array(bufferLength);
+        sourceNode.connect(analyser);
+        analyser.connect(audioContext.destination);
+    }
+    
+    function init() {
+        const containerRect = ballContainer.getBoundingClientRect();
+        const blueBallPercentage = 30;
+        const standardBallsCount = BALL_COUNT - 1;
+        let remainingPercentage = 100;
+        const standardBallPercentages = [];
+        for (let i = 0; i < standardBallsCount - 1; i++) {
+            const randPercentage = Math.random() * (remainingPercentage / (standardBallsCount - i));
+            standardBallPercentages.push(randPercentage);
+            remainingPercentage -= randPercentage;
+        }
+        standardBallPercentages.push(remainingPercentage);
+
+        let standardBallIndex = 0;
+        for (let i = 0; i < BALL_COUNT; i++) {
+            const ballEl = document.createElement('div');
+            ballEl.classList.add('ball');
+            const color = colors[i % colors.length];
+            ballEl.style.backgroundColor = color;
+            
+            let percentage;
+            if (i === 2) { percentage = blueBallPercentage; } 
+            else { percentage = standardBallPercentages[standardBallIndex++]; }
+
+            const ball = {
+                id: i, el: ballEl, color: color,
+                x: Math.random() * containerRect.width * 0.8 + containerRect.width * 0.1,
+                y: Math.random() * containerRect.height * 0.5,
+                vx: (Math.random() - 0.5) * 4, vy: (Math.random() - 0.5) * 4,
+                percentage: percentage, radius: 0, dragVx: 0, dragVy: 0
+            };
+            updateBallAppearance(ball);
+            balls.push(ball);
+            ballContainer.appendChild(ballEl);
+            ballEl.addEventListener('mousedown', (e) => onDragStart(e, ball));
+            ballEl.addEventListener('touchstart', (e) => onDragStart(e, ball), { passive: false });
+        }
+        resizeHandler();
+    }
+
+    function updateAudioParams({deltaSpeed = 0, deltaVolume = 0, absoluteSpeed = null}) {
+        hudActiveUntil = Date.now() + 2000;
+        const blueBall = balls.find(b => b.id === 2);
+        if (!blueBall) return;
+    
+        let newVolume = audioPlayer.volume + deltaVolume;
+        newVolume = Math.max(0, Math.min(1, newVolume));
+        audioPlayer.volume = newVolume;
+    
+        let newSpeed = absoluteSpeed !== null ? absoluteSpeed : audioPlayer.playbackRate + deltaSpeed;
+        newSpeed = Math.max(0.5, Math.min(1.25, newSpeed));
+    
+        if ((lastPlaybackRate < 1.0 && newSpeed >= 1.0) || (lastPlaybackRate > 1.0 && newSpeed <= 1.0)) {
+            if(hasMusicStartedOnce) createParticleBurst(blueBall.x, blueBall.y);
+        }
+        lastPlaybackRate = newSpeed;
+        audioPlayer.playbackRate = newSpeed;
+
+        const minPercentage = 2, maxPercentage = 60;
+        blueBall.percentage = minPercentage + (newVolume * (maxPercentage - minPercentage));
+        const minLightness = 50, maxLightness = 85;
+        const speedRange = 1.25 - 0.5, currentSpeedPos = newSpeed - 0.5;
+        const lightnessRange = maxLightness - minLightness;
+        const newLightness = minLightness + (currentSpeedPos / speedRange) * lightnessRange;
+        blueBall.el.style.backgroundColor = `hsl(217, 95%, ${newLightness}%)`;
+        updateBallAppearance(blueBall);
+    }
+
+    function onDragStart(e, ball) {
+        if (!hasMusicStartedOnce) {
+            setupAudioContext();
+            audioPlayer.volume = 0.5;
+            audioPlayer.play();
+            hasMusicStartedOnce = true;
+        }
+        e.preventDefault();
+        activeBall = ball;
+        const event = e.touches ? e.touches[0] : e;
+        startX = event.clientX;
+        startY = event.clientY;
+    }
+
+    function onDragMove(e) {
+        if (!activeBall) return;
+        e.preventDefault();
+        const event = e.touches ? e.touches[0] : e;
+        const deltaX = event.clientX - startX;
+        const deltaY = event.clientY - startY;
+        
+        const containerRect = ballContainer.getBoundingClientRect();
+        let newX = activeBall.x + deltaX;
+        let newY = activeBall.y + deltaY;
+
+        let floor = containerRect.height;
+        if (!audioPlayer.paused && eqBarHeights.length > 0) {
+            const totalBars = eqBarHeights.length;
+            const barWidth = containerRect.width / totalBars;
+            const startIdx = Math.max(0, Math.floor((newX - activeBall.radius) / barWidth));
+            const endIdx = Math.min(totalBars - 1, Math.floor((newX + activeBall.radius) / barWidth));
+            let maxBarHeight = 0;
+            for (let i = startIdx; i <= endIdx; i++) {
+                maxBarHeight = Math.max(maxBarHeight, eqBarHeights[i] || 0);
+            }
+            floor = containerRect.height - maxBarHeight;
+        }
+
+        activeBall.x = Math.max(activeBall.radius, Math.min(newX, containerRect.width - activeBall.radius));
+        activeBall.y = Math.max(activeBall.radius, Math.min(newY, floor - activeBall.radius));
+
+        activeBall.dragVx = deltaX;
+        activeBall.dragVy = deltaY;
+        startX = event.clientX;
+        startY = event.clientY;
+
+        if (activeBall.id === 2) {
+            updateAudioParams({deltaSpeed: deltaX * 0.005, deltaVolume: -deltaY * 0.01});
+        } else {
+            redistributePercentages(activeBall, deltaX * 0.1);
+        }
+    }
+
+    function onDragEnd(e) {
+        if (!activeBall) return;
+        const lastMoveDistance = Math.sqrt(activeBall.dragVx**2 + activeBall.dragVy**2);
+        if (lastMoveDistance < 5) {
+            if (activeBall.id === 1) {
+                if (audioPlayer.paused) {
+                    if (!hasMusicStartedOnce) { setupAudioContext(); hasMusicStartedOnce = true; }
+                    audioPlayer.play();
+                } else {
+                    audioPlayer.pause();
+                }
+            }
+            activeBall.vx = 0; activeBall.vy = 0;
+        } else {
+            let throwVx = activeBall.dragVx * THROW_MULTIPLIER;
+            let throwVy = activeBall.dragVy * THROW_MULTIPLIER;
+            activeBall.vx = Math.max(-MAX_THROW_SPEED, Math.min(throwVx, MAX_THROW_SPEED));
+            activeBall.vy = Math.max(-MAX_THROW_SPEED, Math.min(throwVy, MAX_THROW_SPEED));
+        }
+        activeBall = null;
+    }
+
+    window.addEventListener('mousemove', onDragMove);
+    window.addEventListener('touchmove', onDragMove, { passive: false });
+    window.addEventListener('mouseup', onDragEnd);
+    window.addEventListener('touchend', onDragEnd);
+    
+    function redistributePercentages(changedBall, change) {
+        const minPercentage = 2, maxPercentage = 60;
+        let newPercentage = changedBall.percentage + change;
+        newPercentage = Math.max(minPercentage, Math.min(maxPercentage, newPercentage));
+        const actualChange = newPercentage - changedBall.percentage;
+        if (Math.abs(actualChange) < 0.001) return;
+        changedBall.percentage = newPercentage;
+
+        const otherBalls = balls.filter(b => b.id !== changedBall.id && b.id !== 2);
+        if (otherBalls.length === 0) return;
+
+        let totalToDistribute = -actualChange;
+        let weights = otherBalls.map(() => Math.random());
+        let totalWeight = weights.reduce((sum, w) => sum + w, 0);
+        if (totalWeight === 0) return;
+
+        for (let i = 0; i < otherBalls.length; i++) {
+            const ball = otherBalls[i];
+            ball.percentage += (weights[i] / totalWeight) * totalToDistribute;
+        }
+
+        const standardBalls = balls.filter(b => b.id !== 2);
+        let currentTotal = standardBalls.reduce((sum, b) => sum + b.percentage, 0);
+        let error = 100 - currentTotal;
+        const adjustableBalls = standardBalls.filter(b => b.id !== changedBall.id && b.percentage > minPercentage && b.percentage < maxPercentage);
+        if (adjustableBalls.length > 0) {
+             adjustableBalls.forEach(b => b.percentage += error / adjustableBalls.length);
+        }
+        standardBalls.forEach(ball => {
+            ball.percentage = Math.max(minPercentage, Math.min(maxPercentage, ball.percentage));
+        });
+    }
+    
+    function updateBallAppearance(ball) {
+        const baseDiameter = 20;
+        const diameter = (baseDiameter + (ball.percentage * 2.5));
+        ball.el.style.width = `${diameter}px`;
+        ball.el.style.height = `${diameter}px`;
+        ball.radius = diameter / 2;
+    }
+
+    function updateAndDrawVisualizer() {
+        if (!analyser) return;
+        analyser.getByteFrequencyData(frequencyData);
+        
+        const avgVolume = frequencyData.reduce((a, b) => a + b, 0) / frequencyData.length;
+        const volumeRatio = Math.min(1, avgVolume / 140);
+        const baselineLightness = 30 + (volumeRatio * 40);
+        ctx.strokeStyle = `hsl(262, 89%, ${baselineLightness}%)`;
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(0, canvas.height);
+        ctx.lineTo(canvas.width, canvas.height);
+        ctx.stroke();
+
+        const numBars = analyser.frequencyBinCount / 2;
+        const barWidth = (canvas.width / 2) / numBars;
+        const centerX = canvas.width / 2;
+        
+        const gradient = ctx.createLinearGradient(0, canvas.height, 0, canvas.height - (canvas.height * 0.4));
+        gradient.addColorStop(0, '#833bf4');
+        gradient.addColorStop(0.5, '#46b9ea');
+        gradient.addColorStop(1, '#75efda');
+        ctx.strokeStyle = gradient;
+        
+        ctx.lineWidth = barWidth * 0.8;
+        ctx.lineCap = 'round';
+        eqBarHeights.length = 0;
+        for (let i = 0; i < numBars; i++) {
+            let dataValue = (frequencyData[i] || 0) * EQ_SENSITIVITY;
+            const barHeight = (dataValue / 255) * (canvas.height * 0.4);
+            eqBarHeights[Math.floor(numBars - 1 - i)] = barHeight;
+            eqBarHeights[numBars + i] = barHeight;
+            const xRight = centerX + (i * barWidth) + (barWidth / 2);
+            ctx.beginPath(); ctx.moveTo(xRight, canvas.height); ctx.lineTo(xRight, canvas.height - barHeight); ctx.stroke();
+            const xLeft = centerX - (i * barWidth) - (barWidth / 2);
+            ctx.beginPath(); ctx.moveTo(xLeft, canvas.height); ctx.lineTo(xLeft, canvas.height - barHeight); ctx.stroke();
+        }
+    }
+    
+    function handleAllCollisions(ball) {
+        if (eqBarHeights.length === 0 || !analyser) return;
+        const containerRect = ballContainer.getBoundingClientRect();
+        const totalBars = eqBarHeights.length;
+        const barWidth = containerRect.width / totalBars;
+        const bounceFactor = -0.85;
+
+        const ballLeftEdgeX = ball.x - ball.radius;
+        const ballRightEdgeX = ball.x + ball.radius;
+        const startBarIndex = Math.max(0, Math.floor(ballLeftEdgeX / barWidth));
+        const endBarIndex = Math.min(totalBars - 1, Math.floor(ballRightEdgeX / barWidth));
+        
+        let maxBarHeight = 0;
+        for (let i = startBarIndex; i <= endBarIndex; i++) { maxBarHeight = Math.max(maxBarHeight, eqBarHeights[i] || 0); }
+        const surfaceY = containerRect.height - maxBarHeight;
+        if (ball.y + ball.radius > surfaceY && ball.vy > 0) {
+            ball.y = surfaceY - ball.radius;
+            ball.vy *= bounceFactor;
+        }
+    }
+    
+    function createParticleBurst(x, y) {
+        for (let i = 0; i < 20; i++) {
+            const angle = Math.random() * Math.PI * 2;
+            const speed = Math.random() * 5 + 2;
+            particles.push({ x, y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed, size: Math.random() * 2 + 1, lifespan: 40 });
+        }
+    }
+
+    function updateAndDrawParticles() {
+        for (let i = particles.length - 1; i >= 0; i--) {
+            const p = particles[i];
+            p.x += p.vx; p.y += p.vy; p.vx *= 0.97; p.vy *= 0.97; p.lifespan--;
+            if (p.lifespan <= 0) {
+                particles.splice(i, 1);
+            } else {
+                ctx.globalAlpha = p.lifespan / 40;
+                ctx.fillStyle = '#FFFFFF';
+                ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2); ctx.fill();
+                ctx.globalAlpha = 1.0;
+            }
+        }
+    }
+
+    function animationLoop() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        updateAndDrawParticles();
+        if (analyser) {
+            updateAndDrawVisualizer();
+            updateLaunchpadDisplay();
+        }
+        const containerRect = ballContainer.getBoundingClientRect();
+        const bounceFactor = -0.85;
+
+        balls.forEach(ball => {
+            if (ball !== activeBall) {
+                if (audioPlayer.paused) {
+                    const centerX = containerRect.width / 2, centerY = containerRect.height / 2;
+                    ball.vx += (centerX - ball.x) * 0.0002; ball.vy += (centerY - ball.y) * 0.0002;
+                    ball.vx *= 0.95; ball.vy *= 0.95;
+                } else {
+                    ball.vy += 0.1; ball.vx *= 0.99;
+                }
+                ball.x += ball.vx; ball.y += ball.vy;
+            }
+
+            if (ball.x - ball.radius < 0) { ball.x = ball.radius; ball.vx *= bounceFactor; }
+            if (ball.x + ball.radius > containerRect.width) { ball.x = containerRect.width - ball.radius; ball.vx *= bounceFactor; }
+            if (ball.y - ball.radius < 0) { ball.y = ball.radius; ball.vy *= bounceFactor; }
+            
+            if (!audioPlayer.paused) {
+                handleAllCollisions(ball);
+            } else {
+                if (ball.y + ball.radius > containerRect.height) { ball.y = containerRect.height - ball.radius; ball.vy *= bounceFactor; }
+            }
+
+            updateBallAppearance(ball);
+            ball.el.style.left = `${ball.x}px`;
+            ball.el.style.top = `${ball.y}px`;
+        });
+        
+        for (let i = 0; i < BALL_COUNT; i++) {
+            for (let j = i + 1; j < BALL_COUNT; j++) {
+                const b1 = balls[i], b2 = balls[j];
+                const dx = b2.x - b1.x, dy = b2.y - b1.y;
+                const distance = Math.sqrt(dx*dx + dy*dy);
+                const minDistance = b1.radius + b2.radius;
+                if(distance < minDistance){
+                    const angle=Math.atan2(dy,dx), overlap=(minDistance-distance)/2;
+                    if(b1 !== activeBall){ b1.x-=Math.cos(angle)*overlap; b1.y-=Math.sin(angle)*overlap; }
+                    if(b2 !== activeBall){ b2.x+=Math.cos(angle)*overlap; b2.y+=Math.sin(angle)*overlap; }
+                    
+                    if(b1 !== activeBall && b2 !== activeBall){
+                        const nx=dx/distance, ny=dy/distance, v1n=b1.vx*nx+b1.vy*ny, v2n=b2.vx*nx+b2.vy*ny;
+                        const v1t = b1.vx*ny - b1.vy*nx, v2t = b2.vx*ny - b2.vy*nx;
+                        b1.vx = v2n * nx + v1t * ny; b1.vy = v2n * ny - v1t * nx;
+                        b2.vx = v1n * nx + v2t * ny; b2.vy = v1n * ny - v2t * nx;
+                    }
+                }
+            }
+        }
+        requestAnimationFrame(animationLoop);
+    }
+
+    function resizeHandler() {
+         const containerRect = container.getBoundingClientRect();
+         canvas.width = containerRect.width;
+         canvas.height = containerRect.height;
+         balls.forEach(b => updateBallAppearance(b));
+    }
+    window.addEventListener('resize', resizeHandler);
+
+    init();
+    animationLoop();
+</script>
+</body>
+</html>
