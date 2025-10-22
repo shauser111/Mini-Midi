@@ -1,1 +1,1 @@
-This is a mini midi app that plays music which animates a waveform. The balls can be grabbbed and thrown around the screen. Experiment. You will see the movement of the balls on your Novation Launchpad Mini MK3.
+
